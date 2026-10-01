@@ -120,7 +120,7 @@
  * nested loop (22,415 + 2 * (C - 100) > 23,032 needs C > 408).  Re-measure JOB when either
  * bound moves. */
 #define HJ_MEM_ALLOC_CONSTANT 800
-#define HJ_FILE_IO_WEIGHT 0.5	/* per-row IO weight for partitioned hash-join spill */
+#define HJ_SPILL_IO_PASSES 2.0	/* partitioned hash-join spill writes every input page once and reads it back once */
 #define HJ_PARTITION_FILL_FACTOR 0.8	/* must match PARTITION_FILL_FACTOR in query_hash_join.c:
 					   the executor spills to a partitioned hash join once the build
 					   entries exceed mem_limit * fill-factor, not the raw mem_limit */
@@ -4109,14 +4109,17 @@ qo_hjoin_cost (QO_PLAN * plan_p)
      * Keep the two in sync. */
     UINT64 per_entry_size = 2 * sizeof (MHT_HLS_SLOT) + sizeof (MHT_HLS_ENTRY) + HJ_HASH_ENTRY_POS_SIZE;
 
+    /* spill IO in pages, the same unit as inner_pages/outer_pages and qo_sort_cost () */
+    double spill_io_cost = (inner_pages + outer_pages) * HJ_SPILL_IO_PASSES;
+
     if ((inner_cardinality * per_entry_size) > mem_limit * HJ_PARTITION_FILL_FACTOR)
       {
-	inner_build_io_cost += (inner_cardinality + outer_cardinality) * HJ_FILE_IO_WEIGHT;
+	inner_build_io_cost += spill_io_cost;
       }
 
     if ((outer_cardinality * per_entry_size) > mem_limit * HJ_PARTITION_FILL_FACTOR)
       {
-	outer_build_io_cost += (inner_cardinality + outer_cardinality) * HJ_FILE_IO_WEIGHT;
+	outer_build_io_cost += spill_io_cost;
       }
   }
 
