@@ -6521,6 +6521,11 @@ qo_classify_outerjoin_terms (QO_ENV * env)
 	      continue;		/* semi/anti: not outer-join null-padding semantics, keep excluded */
 	    }
 
+	  if (QO_TERM_CLASS (term) == QO_TC_DUMMY_JOIN)
+	    {
+	      continue;		/* no real predicate; QO_TERM_NODES is a structural link to p_node, not a data dependency */
+	    }
+
 	  if (QO_NODE_PT_JOIN_TYPE (on_node) == PT_JOIN_INNER)
 	    {
 	      /*
