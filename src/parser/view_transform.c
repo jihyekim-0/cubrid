@@ -51,6 +51,18 @@
 /* max number of view references considered for sharing the result of a view in a statement */
 #define MQ_SHARED_VIEW_MAX_SPECS 64
 
+/* max number of tables matched when the derived tables of two references of a view are compared */
+#define MQ_SAME_BODY_MAX_SPECS 32
+
+/* the tables of a reference of a view matched with the tables of the representative of its group */
+typedef struct mq_spec_map
+{
+  PT_NODE *rep_specs[MQ_SAME_BODY_MAX_SPECS];	/* tables of the representative */
+  UINTPTR ids[MQ_SAME_BODY_MAX_SPECS];	/* spec ids of the matching tables of the other reference */
+  int n_specs;
+  bool failed;			/* a name could not be mapped to a table of the representative */
+} MQ_SPEC_MAP;
+
 #define MQ_IS_OUTER_JOIN_SPEC(s)                               \
     (						               \
      ((s)->info.spec.join_type == PT_JOIN_LEFT_OUTER           \
@@ -473,6 +485,20 @@ static PT_NODE *mq_collect_shared_derived_pre (PARSER_CONTEXT * parser, PT_NODE 
 static PT_NODE *mq_find_unshareable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 static bool mq_is_top_level_from_spec (PT_NODE * query, PT_NODE * spec);
 static bool mq_has_named_columns_first (PT_NODE * spec);
+static PT_NODE *mq_find_mapped_spec (MQ_SPEC_MAP * map, UINTPTR spec_id);
+static bool mq_is_same_node (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_node, PT_NODE * node);
+static bool mq_is_same_node_list (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_list, PT_NODE * list);
+static bool mq_is_table_spec (PT_NODE * spec);
+static bool mq_is_same_spec_list (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_spec, PT_NODE * spec);
+static PT_NODE *mq_get_order_by_column (PT_NODE * query, PT_NODE * order);
+static bool mq_is_same_order_by (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_query, PT_NODE * query);
+static bool mq_has_select_extras (PT_NODE * query);
+static bool mq_is_same_select (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_query, PT_NODE * query,
+			       bool with_list);
+static PT_NODE *mq_map_column_names_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
+static bool mq_is_adoptable_spec (PT_NODE * spec, PT_NODE * rep);
+static bool mq_has_view_columns (PT_NODE * spec, PT_NODE * rep);
+static bool mq_add_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep);
 static bool mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep);
 static void mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement);
 /*
@@ -9764,23 +9790,384 @@ mq_has_named_columns_first (PT_NODE * spec)
 }
 
 /*
- * mq_adopt_view_columns () - give a derived spec the columns of the representative of its group, in the same order
- *   return: false if spec uses a column the representative does not have; spec is then left unchanged
+ * mq_find_mapped_spec () - find the table of the representative that matches a table of another reference
+ *   return: table of the representative, NULL if spec_id is not matched
+ *   map(in):
+ *   spec_id(in): spec id of a table of the other reference
+ */
+static PT_NODE *
+mq_find_mapped_spec (MQ_SPEC_MAP * map, UINTPTR spec_id)
+{
+  int i;
+
+  for (i = 0; i < map->n_specs; i++)
+    {
+      if (map->ids[i] == spec_id)
+	{
+	  return map->rep_specs[i];
+	}
+    }
+
+  return NULL;
+}
+
+/*
+ * mq_is_same_node () - is a node of another reference the same as a node of the representative
+ *   return: true if they are the same, false if they differ or can not be compared
  *   parser(in):
- *   spec(in/out): derived spec rewritten from the view of rep
- *   rep(in): derived spec whose result spec will scan
+ *   map(in/out): matched tables
+ *   rep_node(in): node of the representative
+ *   node(in): node of the other reference
  *
- * Note: the columns spec does not use are added as NULL; the derived table of spec is not generated, but its
- *	 hidden columns stay at the end and the positions of its ORDER BY are moved with the columns
+ * Note: a name is the same if it refers to the matching table. A node of a kind that is not compared here is
+ *       taken as different, which only keeps the references from sharing.
  */
 static bool
-mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
+mq_is_same_node (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_node, PT_NODE * node)
+{
+  PT_NODE *rep_spec;
+  const char *rep_text, *text;
+
+  if (rep_node == NULL || node == NULL)
+    {
+      return rep_node == node;
+    }
+
+  if (rep_node->node_type != node->node_type || rep_node->type_enum != node->type_enum)
+    {
+      return false;
+    }
+
+  switch (node->node_type)
+    {
+    case PT_NAME:
+      if (rep_node->info.name.meta_class != node->info.name.meta_class
+	  || rep_node->info.name.db_object != node->info.name.db_object
+	  || rep_node->info.name.original == NULL || node->info.name.original == NULL
+	  || intl_identifier_casecmp (rep_node->info.name.original, node->info.name.original) != 0)
+	{
+	  return false;
+	}
+      rep_spec = mq_find_mapped_spec (map, node->info.name.spec_id);
+      if (rep_spec != NULL ? rep_node->info.name.spec_id != rep_spec->info.spec.id
+	  : rep_node->info.name.spec_id != node->info.name.spec_id)
+	{
+	  return false;
+	}
+      break;
+
+    case PT_VALUE:
+    case PT_DATA_TYPE:
+      rep_text = parser_print_tree (parser, rep_node);
+      text = parser_print_tree (parser, node);
+      if (rep_text == NULL || text == NULL || strcmp (rep_text, text) != 0)
+	{
+	  return false;
+	}
+      break;
+
+    case PT_EXPR:
+      if (rep_node->info.expr.op != node->info.expr.op || rep_node->info.expr.qualifier != node->info.expr.qualifier
+	  || rep_node->info.expr.flag != node->info.expr.flag
+	  || rep_node->info.expr.location != node->info.expr.location
+	  || rep_node->info.expr.coll_modifier != node->info.expr.coll_modifier
+	  || rep_node->info.expr.recursive_type != node->info.expr.recursive_type
+	  || !mq_is_same_node_list (parser, map, rep_node->info.expr.arg1, node->info.expr.arg1)
+	  || !mq_is_same_node_list (parser, map, rep_node->info.expr.arg2, node->info.expr.arg2)
+	  || !mq_is_same_node_list (parser, map, rep_node->info.expr.arg3, node->info.expr.arg3)
+	  || !mq_is_same_node (parser, map, rep_node->info.expr.cast_type, node->info.expr.cast_type))
+	{
+	  return false;
+	}
+      break;
+
+    case PT_FUNCTION:
+      if (rep_node->info.function.function_type != node->info.function.function_type
+	  || rep_node->info.function.all_or_distinct != node->info.function.all_or_distinct
+	  || rep_node->info.function.coll_modifier != node->info.function.coll_modifier
+	  || rep_node->info.function.analytic.is_analytic || node->info.function.analytic.is_analytic
+	  || rep_node->info.function.function_type == PT_GENERIC
+	  || !mq_is_same_node_list (parser, map, rep_node->info.function.arg_list, node->info.function.arg_list)
+	  || !mq_is_same_node_list (parser, map, rep_node->info.function.order_by, node->info.function.order_by)
+	  || !mq_is_same_node (parser, map, rep_node->info.function.percentile, node->info.function.percentile))
+	{
+	  return false;
+	}
+      break;
+
+    case PT_SORT_SPEC:
+      /* the position of a GROUP BY key is not compared; it is resolved by its expression */
+      if (rep_node->info.sort_spec.asc_or_desc != node->info.sort_spec.asc_or_desc
+	  || rep_node->info.sort_spec.nulls_first_or_last != node->info.sort_spec.nulls_first_or_last
+	  || !mq_is_same_node (parser, map, rep_node->info.sort_spec.expr, node->info.sort_spec.expr))
+	{
+	  return false;
+	}
+      break;
+
+    case PT_SELECT:
+      if (!mq_is_same_select (parser, map, rep_node, node, true))
+	{
+	  return false;
+	}
+      break;
+
+    default:
+      return false;
+    }
+
+  return mq_is_same_node (parser, map, rep_node->or_next, node->or_next);
+}
+
+/*
+ * mq_is_same_node_list () - is a node list of another reference the same as a node list of the representative
+ *   return: true if they are the same
+ *   parser(in):
+ *   map(in/out): matched tables
+ *   rep_list(in): node list of the representative
+ *   list(in): node list of the other reference
+ */
+static bool
+mq_is_same_node_list (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_list, PT_NODE * list)
+{
+  for (; rep_list != NULL && list != NULL; rep_list = rep_list->next, list = list->next)
+    {
+      if (!mq_is_same_node (parser, map, rep_list, list))
+	{
+	  return false;
+	}
+    }
+
+  return rep_list == NULL && list == NULL;
+}
+
+/*
+ * mq_is_table_spec () - is spec a plain table, without a derived table, a path or a partition
+ *   return: true if so
+ *   spec(in):
+ */
+static bool
+mq_is_table_spec (PT_NODE * spec)
+{
+  return (spec->node_type == PT_SPEC && spec->info.spec.entity_name != NULL
+	  && spec->info.spec.entity_name->node_type == PT_NAME && spec->info.spec.derived_table == NULL
+	  && spec->info.spec.cte_name == NULL && spec->info.spec.cte_pointer == NULL
+	  && spec->info.spec.remote_server_name == NULL && spec->info.spec.except_list == NULL
+	  && spec->info.spec.path_entities == NULL && spec->info.spec.path_conjuncts == NULL
+	  && spec->info.spec.method_list == NULL && spec->info.spec.partition == NULL
+	  && spec->info.spec.json_table == NULL && spec->info.spec.using_cond == NULL
+	  && spec->info.spec.range_var != NULL);
+}
+
+/*
+ * mq_is_same_spec_list () - match the tables of a FROM clause of another reference with those of the representative
+ *   return: true if they are the same tables joined the same way
+ *   parser(in):
+ *   map(in/out): the matched tables are added
+ *   rep_spec(in): FROM clause of the representative
+ *   spec(in): FROM clause of the other reference
+ */
+static bool
+mq_is_same_spec_list (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_spec, PT_NODE * spec)
+{
+  PT_NODE *rep_from = rep_spec, *from = spec;
+
+  for (; rep_spec != NULL && spec != NULL; rep_spec = rep_spec->next, spec = spec->next)
+    {
+      if (!mq_is_table_spec (rep_spec) || !mq_is_table_spec (spec)
+	  || rep_spec->info.spec.entity_name->info.name.db_object != spec->info.spec.entity_name->info.name.db_object
+	  || rep_spec->info.spec.only_all != spec->info.spec.only_all
+	  || rep_spec->info.spec.meta_class != spec->info.spec.meta_class
+	  || rep_spec->info.spec.flavor != spec->info.spec.flavor
+	  || rep_spec->info.spec.join_type != spec->info.spec.join_type
+	  || rep_spec->info.spec.location != spec->info.spec.location
+	  || rep_spec->info.spec.natural != spec->info.spec.natural || rep_spec->info.spec.flag != spec->info.spec.flag
+	  || map->n_specs >= MQ_SAME_BODY_MAX_SPECS)
+	{
+	  return false;
+	}
+
+      map->rep_specs[map->n_specs] = rep_spec;
+      map->ids[map->n_specs++] = spec->info.spec.id;
+    }
+
+  if (rep_spec != NULL || spec != NULL)
+    {
+      return false;
+    }
+
+  /* a join condition can refer to any table of the FROM clause */
+  for (rep_spec = rep_from, spec = from; rep_spec != NULL; rep_spec = rep_spec->next, spec = spec->next)
+    {
+      if (!mq_is_same_node_list (parser, map, rep_spec->info.spec.on_cond, spec->info.spec.on_cond))
+	{
+	  return false;
+	}
+    }
+
+  return true;
+}
+
+/*
+ * mq_get_order_by_column () - get the column of the SELECT list that an ORDER BY key sorts by
+ *   return: column, NULL if the key is not a position in the SELECT list
+ *   query(in):
+ *   order(in): ORDER BY key of query
+ */
+static PT_NODE *
+mq_get_order_by_column (PT_NODE * query, PT_NODE * order)
+{
+  if (order->info.sort_spec.expr == NULL || order->info.sort_spec.expr->node_type != PT_VALUE)
+    {
+      return NULL;
+    }
+
+  return pt_get_node_from_list (query->info.query.q.select.list, order->info.sort_spec.pos_descr.pos_no - 1);
+}
+
+/*
+ * mq_is_same_order_by () - does another reference sort the same way as the representative
+ *   return: true if so
+ *   parser(in):
+ *   map(in/out): matched tables
+ *   rep_query(in): query of the representative
+ *   query(in): query of the other reference
+ *
+ * Note: an ORDER BY key is a position in the SELECT list, so the columns at the positions are compared
+ */
+static bool
+mq_is_same_order_by (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_query, PT_NODE * query)
+{
+  PT_NODE *rep_order, *order, *rep_col, *col;
+
+  for (rep_order = rep_query->info.query.order_by, order = query->info.query.order_by;
+       rep_order != NULL && order != NULL; rep_order = rep_order->next, order = order->next)
+    {
+      rep_col = mq_get_order_by_column (rep_query, rep_order);
+      col = mq_get_order_by_column (query, order);
+      if (rep_col == NULL || col == NULL
+	  || rep_order->info.sort_spec.asc_or_desc != order->info.sort_spec.asc_or_desc
+	  || rep_order->info.sort_spec.nulls_first_or_last != order->info.sort_spec.nulls_first_or_last
+	  || !mq_is_same_node (parser, map, rep_col, col))
+	{
+	  return false;
+	}
+    }
+
+  return rep_order == NULL && order == NULL;
+}
+
+/*
+ * mq_has_select_extras () - does a SELECT have a clause or a hint that is not compared
+ *   return: true if so
+ *   query(in): SELECT
+ */
+static bool
+mq_has_select_extras (PT_NODE * query)
+{
+  PT_QUERY_INFO *info = &query->info.query;
+  PT_SELECT_INFO *select = &query->info.query.q.select;
+
+  return (info->orderby_for != NULL || info->limit != NULL || info->into_list != NULL || info->with != NULL
+	  || select->connect_by != NULL || select->start_with != NULL || select->after_cb_filter != NULL
+	  || select->using_index != NULL || select->with_increment != NULL || select->leading != NULL
+	  || select->use_nl != NULL || select->use_idx != NULL || select->index_ss != NULL || select->index_ls != NULL
+	  || select->use_merge != NULL || select->no_use_hash != NULL || select->use_hash != NULL
+	  || select->check_where != NULL || select->for_update != NULL);
+}
+
+/*
+ * mq_is_same_select () - is a SELECT of another reference the same as a SELECT of the representative
+ *   return: true if so
+ *   parser(in):
+ *   map(in/out): the matched tables are added
+ *   rep_query(in): SELECT of the representative
+ *   query(in): SELECT of the other reference
+ *   with_list(in): false to leave the SELECT lists out, except the ORDER BY keys
+ */
+static bool
+mq_is_same_select (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_query, PT_NODE * query, bool with_list)
+{
+  PT_SELECT_INFO *rep_select, *select;
+
+  if (!PT_IS_SELECT (rep_query) || !PT_IS_SELECT (query) || mq_has_select_extras (rep_query)
+      || mq_has_select_extras (query))
+    {
+      return false;
+    }
+
+  rep_select = &rep_query->info.query.q.select;
+  select = &query->info.query.q.select;
+  if (rep_query->info.query.correlation_level != query->info.query.correlation_level
+      || rep_query->info.query.all_distinct != query->info.query.all_distinct
+      || rep_query->info.query.hint != query->info.query.hint || rep_select->hint != select->hint
+      || rep_select->flavor != select->flavor || rep_select->flag != select->flag)
+    {
+      return false;
+    }
+
+  return (mq_is_same_spec_list (parser, map, rep_select->from, select->from)
+	  && (!with_list || mq_is_same_node_list (parser, map, rep_select->list, select->list))
+	  && mq_is_same_node_list (parser, map, rep_select->where, select->where)
+	  && mq_is_same_node_list (parser, map, rep_select->group_by, select->group_by)
+	  && mq_is_same_node_list (parser, map, rep_select->having, select->having)
+	  && mq_is_same_order_by (parser, map, rep_query, query));
+}
+
+/*
+ * mq_map_column_names_pre () - make the names of a column of another reference refer to the matching tables of
+ *                              the representative
+ *   return: node
+ *   parser(in):
+ *   node(in/out):
+ *   arg(in/out): MQ_SPEC_MAP; failed is set if a name has no matching table
+ *   continue_walk(in/out):
+ */
+static PT_NODE *
+mq_map_column_names_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  MQ_SPEC_MAP *map = (MQ_SPEC_MAP *) arg;
+  PT_NODE *rep_spec;
+
+  if (PT_IS_QUERY (node))
+    {
+      /* a subquery has tables of its own */
+      map->failed = true;
+    }
+  else if (node->node_type == PT_NAME)
+    {
+      rep_spec = mq_find_mapped_spec (map, node->info.name.spec_id);
+      if (rep_spec != NULL)
+	{
+	  node->info.name.spec_id = rep_spec->info.spec.id;
+	  node->info.name.resolved = rep_spec->info.spec.range_var->info.name.original;
+	}
+      else
+	{
+	  map->failed = true;
+	}
+    }
+
+  if (map->failed)
+    {
+      *continue_walk = PT_STOP_WALK;
+    }
+
+  return node;
+}
+
+/*
+ * mq_is_adoptable_spec () - can a derived spec be given the columns of the representative of its group
+ *   return: true if so
+ *   spec(in): derived spec rewritten from the view of rep
+ *   rep(in): representative
+ */
+static bool
+mq_is_adoptable_spec (PT_NODE * spec, PT_NODE * rep)
 {
   PT_NODE *query = spec->info.spec.derived_table;
-  PT_NODE *rep_attr, *attr, *col, *prev_attr, *prev_col, *order;
-  PT_NODE *attrs_head = NULL, *attrs_tail = NULL, *cols_head = NULL, *cols_tail = NULL, *hidden_cols = NULL;
-  PT_NODE **old_cols = NULL;
-  int n_cols, n_attrs, pos;
+  PT_NODE *rep_attr, *order;
+  int n_cols, pos;
 
   if (spec->info.spec.as_attr_list == NULL || spec->info.spec.range_var == NULL || !mq_has_named_columns_first (spec))
     {
@@ -9807,14 +10194,26 @@ mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
 	}
     }
 
+  return true;
+}
+
+/*
+ * mq_has_view_columns () - does the representative have all the columns a derived spec uses
+ *   return: true if so
+ *   spec(in): derived spec rewritten from the view of rep
+ *   rep(in): representative
+ */
+static bool
+mq_has_view_columns (PT_NODE * spec, PT_NODE * rep)
+{
+  PT_NODE *query = spec->info.spec.derived_table;
+  PT_NODE *attr, *rep_attr;
+
   if (spec->info.spec.as_attr_list->node_type == PT_VALUE && spec->info.spec.as_attr_list->next == NULL
-      && query->info.query.order_by == NULL && n_cols == 1)
+      && query->info.query.order_by == NULL && pt_length_of_list (query->info.query.q.select.list) == 1)
     {
-      /* the reference uses no column of the view, e.g. count(*): its constant column is replaced */
-      parser_free_tree (parser, spec->info.spec.as_attr_list);
-      parser_free_tree (parser, query->info.query.q.select.list);
-      spec->info.spec.as_attr_list = NULL;
-      query->info.query.q.select.list = NULL;
+      /* the reference uses no column of the view, e.g. count(*) */
+      return true;
     }
 
   for (attr = spec->info.spec.as_attr_list; attr != NULL; attr = attr->next)
@@ -9831,6 +10230,160 @@ mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
 	{
 	  return false;
 	}
+    }
+
+  return true;
+}
+
+/*
+ * mq_add_view_columns () - add to the representative the columns of a derived spec that it does not have
+ *   return: false if the columns can not be added; rep is then left unchanged
+ *   parser(in):
+ *   spec(in): derived spec rewritten from the view of rep
+ *   rep(in/out): representative of the group of spec
+ *
+ * Note: the columns are added only if the derived tables of spec and rep differ in their SELECT lists alone, so that
+ *       they give the same rows and a column of spec can be computed from the tables of rep. A column with a
+ *       subquery is not added. The columns are put after the named columns of rep, before its hidden columns.
+ */
+static bool
+mq_add_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
+{
+  MQ_SPEC_MAP map;
+  PT_NODE *query = spec->info.spec.derived_table, *rep_query = rep->info.spec.derived_table;
+  PT_NODE *attr, *col, *rep_attr, *new_attr, *new_col, *order;
+  PT_NODE *attrs_head = NULL, *attrs_tail = NULL, *cols_head = NULL, *cols_tail = NULL;
+  int n_rep_attrs, n_added = 0, pos;
+
+  map.n_specs = 0;
+  map.failed = false;
+  /* with DISTINCT, the SELECT list decides the rows */
+  if (rep->info.spec.as_attr_list == NULL || rep->info.spec.range_var == NULL
+      || rep_query->info.query.all_distinct == PT_DISTINCT
+      || !mq_is_same_select (parser, &map, rep_query, query, false))
+    {
+      return false;
+    }
+
+  for (attr = spec->info.spec.as_attr_list, col = query->info.query.q.select.list; attr != NULL && col != NULL;
+       attr = attr->next, col = col->next)
+    {
+      if (attr->node_type != PT_NAME)
+	{
+	  goto fail;
+	}
+
+      for (rep_attr = rep->info.spec.as_attr_list; rep_attr != NULL; rep_attr = rep_attr->next)
+	{
+	  if (intl_identifier_casecmp (attr->info.name.original, rep_attr->info.name.original) == 0)
+	    {
+	      break;
+	    }
+	}
+      if (rep_attr != NULL)
+	{
+	  continue;
+	}
+
+      new_attr = parser_copy_tree (parser, attr);
+      new_col = parser_copy_tree (parser, col);
+      if (new_attr == NULL || new_col == NULL)
+	{
+	  PT_INTERNAL_ERROR (parser, "allocate new node");
+	  goto fail;
+	}
+
+      if (attrs_tail != NULL)
+	{
+	  attrs_tail->next = new_attr;
+	  cols_tail->next = new_col;
+	}
+      else
+	{
+	  attrs_head = new_attr;
+	  cols_head = new_col;
+	}
+      attrs_tail = new_attr;
+      cols_tail = new_col;
+      n_added++;
+
+      (void) parser_walk_tree (parser, new_col, mq_map_column_names_pre, &map, NULL, NULL);
+      if (map.failed)
+	{
+	  goto fail;
+	}
+      new_attr->info.name.spec_id = rep->info.spec.id;
+      new_attr->info.name.resolved = rep->info.spec.range_var->info.name.original;
+    }
+
+  if (n_added == 0)
+    {
+      return true;
+    }
+
+  n_rep_attrs = pt_length_of_list (rep->info.spec.as_attr_list);
+  col = pt_get_node_from_list (rep_query->info.query.q.select.list, n_rep_attrs - 1);
+  cols_tail->next = col->next;
+  col->next = cols_head;
+  attr = pt_get_node_from_list (rep->info.spec.as_attr_list, n_rep_attrs - 1);
+  attr->next = attrs_head;
+
+  /* the hidden columns moved behind the added columns */
+  for (order = rep_query->info.query.order_by; order != NULL; order = order->next)
+    {
+      pos = order->info.sort_spec.pos_descr.pos_no;
+      if (pos > n_rep_attrs)
+	{
+	  pos += n_added;
+	  order->info.sort_spec.expr->info.value.data_value.i = pos;
+	  order->info.sort_spec.expr->info.value.db_value.data.i = pos;
+	  order->info.sort_spec.expr->info.value.text = NULL;
+	  order->info.sort_spec.pos_descr.pos_no = pos;
+	}
+    }
+
+  return true;
+
+fail:
+  parser_free_tree (parser, attrs_head);
+  parser_free_tree (parser, cols_head);
+  return false;
+}
+
+/*
+ * mq_adopt_view_columns () - give a derived spec the columns of the representative of its group, in the same order
+ *   return: false if spec uses a column the representative does not have; spec is then left unchanged
+ *   parser(in):
+ *   spec(in/out): derived spec rewritten from the view of rep
+ *   rep(in): derived spec whose result spec will scan
+ *
+ * Note: the columns spec does not use are added as NULL; the derived table of spec is not generated, but its
+ *	 hidden columns stay at the end and the positions of its ORDER BY are moved with the columns
+ */
+static bool
+mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
+{
+  PT_NODE *query = spec->info.spec.derived_table;
+  PT_NODE *rep_attr, *attr, *col, *prev_attr, *prev_col, *order;
+  PT_NODE *attrs_head = NULL, *attrs_tail = NULL, *cols_head = NULL, *cols_tail = NULL, *hidden_cols = NULL;
+  PT_NODE **old_cols = NULL;
+  int n_cols, n_attrs, pos;
+
+  if (!mq_is_adoptable_spec (spec, rep) || !mq_has_view_columns (spec, rep))
+    {
+      return false;
+    }
+
+  n_cols = pt_length_of_list (query->info.query.q.select.list);
+
+  if (spec->info.spec.as_attr_list->node_type == PT_VALUE && spec->info.spec.as_attr_list->next == NULL
+      && query->info.query.order_by == NULL && n_cols == 1)
+    {
+      /* the reference uses no column of the view, e.g. count(*): its constant column is replaced */
+      parser_free_tree (parser, spec->info.spec.as_attr_list);
+      parser_free_tree (parser, query->info.query.q.select.list);
+      spec->info.spec.as_attr_list = NULL;
+      query->info.query.q.select.list = NULL;
     }
 
   if (query->info.query.order_by != NULL)
@@ -9943,13 +10496,15 @@ mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
  * Note: the representative of a group is the first reference in the FROM clause of the statement, so materializing
  *	 the view first adds no evaluation that would not have happened anyway. A view is not shared if a predicate
  *	 was pushed into one of its references or if it can give a different result at each evaluation. A reference
- *	 joins the group if it comes after the representative and uses only columns of the representative.
+ *	 joins the group if it comes after the representative and uses only columns of the representative, or if its
+ *	 derived table differs from that of the representative in the SELECT list alone; the representative then
+ *	 computes the columns of that reference too.
  */
 static void
 mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
   MQ_SHARED_VIEW_INFO info;
-  bool grouped[MQ_SHARED_VIEW_MAX_SPECS];
+  bool grouped[MQ_SHARED_VIEW_MAX_SPECS], is_member[MQ_SHARED_VIEW_MAX_SPECS];
   PT_NODE *group[MQ_SHARED_VIEW_MAX_SPECS];
   PT_NODE *rep, *derived;
   int i, j, n, rep_idx, group_id = 0;
@@ -10011,14 +10566,22 @@ mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  continue;
 	}
 
-      has_member = false;
+      /* the representative gets the columns of all the members before they take its columns */
+      memset (is_member, 0, sizeof (is_member));
       for (j = rep_idx + 1; j < n; j++)
 	{
 	  derived = group[j]->info.spec.derived_table;
-	  if (PT_IS_SELECT (derived) && derived->info.query.correlation_level == 0
-	      && mq_adopt_view_columns (parser, group[j], rep))
+	  is_member[j] = (PT_IS_SELECT (derived) && derived->info.query.correlation_level == 0
+			  && mq_is_adoptable_spec (group[j], rep)
+			  && (mq_has_view_columns (group[j], rep) || mq_add_view_columns (parser, group[j], rep)));
+	}
+
+      has_member = false;
+      for (j = rep_idx + 1; j < n; j++)
+	{
+	  if (is_member[j] && mq_adopt_view_columns (parser, group[j], rep))
 	    {
-	      derived->info.query.shared_view_group = group_id + 1;
+	      group[j]->info.spec.derived_table->info.query.shared_view_group = group_id + 1;
 	      has_member = true;
 	    }
 	}
