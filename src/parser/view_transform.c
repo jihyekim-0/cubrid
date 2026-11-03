@@ -9827,6 +9827,7 @@ mq_is_same_node (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_node,
 {
   PT_NODE *rep_spec;
   const char *rep_text, *text;
+  DB_VALUE *rep_val, *val;
 
   if (rep_node == NULL || node == NULL)
     {
@@ -9860,6 +9861,26 @@ mq_is_same_node (PARSER_CONTEXT * parser, MQ_SPEC_MAP * map, PT_NODE * rep_node,
     case PT_DATA_TYPE:
       rep_text = parser_print_tree (parser, rep_node);
       text = parser_print_tree (parser, node);
+      if (rep_text == NULL || text == NULL || strcmp (rep_text, text) != 0)
+	{
+	  return false;
+	}
+      break;
+
+    case PT_HOST_VAR:
+      /* a constant of the view is auto-parameterized for each reference; a value bound per execution is not fixed */
+      if (rep_node->info.host_var.index < parser->host_var_count || node->info.host_var.index < parser->host_var_count)
+	{
+	  return false;
+	}
+      rep_val = pt_host_var_db_value (parser, rep_node);
+      val = pt_host_var_db_value (parser, node);
+      if (rep_val == NULL || val == NULL || DB_VALUE_DOMAIN_TYPE (rep_val) != DB_VALUE_DOMAIN_TYPE (val))
+	{
+	  return false;
+	}
+      rep_text = (const char *) pt_get_varchar_bytes (pt_print_db_value (parser, rep_val));
+      text = (const char *) pt_get_varchar_bytes (pt_print_db_value (parser, val));
       if (rep_text == NULL || text == NULL || strcmp (rep_text, text) != 0)
 	{
 	  return false;
