@@ -482,6 +482,7 @@ static PT_NODE *mq_rewrite_cte_as_derived (PARSER_CONTEXT * parser, PT_NODE * no
 static PT_NODE *mq_count_cte_references (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 static void mq_check_cte_inline_or_materialize (PARSER_CONTEXT * parser, PT_NODE * node);
 static PT_NODE *mq_collect_shared_derived_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
+static PT_NODE *mq_collect_shared_derived_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 static PT_NODE *mq_find_unshareable_expr (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk);
 static bool mq_is_top_level_from_spec (PT_NODE * query, PT_NODE * spec);
 static bool mq_has_named_columns_first (PT_NODE * spec);
@@ -9580,7 +9581,9 @@ mq_rewrite_upd_del_top_level_specs (PARSER_CONTEXT * parser, PT_NODE * statement
 typedef struct mq_shared_view_info
 {
   PT_NODE *specs[MQ_SHARED_VIEW_MAX_SPECS];
+  bool in_correlated[MQ_SHARED_VIEW_MAX_SPECS];	/* in a correlated subquery */
   int n_specs;
+  int correlated_depth;
 } MQ_SHARED_VIEW_INFO;
 
 /*
@@ -9603,6 +9606,12 @@ mq_collect_shared_derived_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       return node;
     }
 
+  if (PT_IS_QUERY (node) && node->info.query.correlation_level != 0)
+    {
+      info->correlated_depth++;
+      return node;
+    }
+
   if (node->node_type != PT_SPEC || !PT_SPEC_IS_DERIVED (node) || node->info.spec.derived_table_type != PT_IS_SUBQUERY)
     {
       return node;
@@ -9621,8 +9630,31 @@ mq_collect_shared_derived_pre (PARSER_CONTEXT * parser, PT_NODE * node, void *ar
       return node;
     }
 
+  info->in_correlated[info->n_specs] = (info->correlated_depth > 0);
   info->specs[info->n_specs++] = node;
 
+  return node;
+}
+
+/*
+ * mq_collect_shared_derived_post () - leave a correlated subquery and resume the walk
+ *   return: node
+ *   parser(in):
+ *   node(in):
+ *   arg(in/out): MQ_SHARED_VIEW_INFO
+ *   continue_walk(in/out):
+ */
+static PT_NODE *
+mq_collect_shared_derived_post (PARSER_CONTEXT * parser, PT_NODE * node, void *arg, int *continue_walk)
+{
+  MQ_SHARED_VIEW_INFO *info = (MQ_SHARED_VIEW_INFO *) arg;
+
+  if (PT_IS_QUERY (node) && node->info.query.correlation_level != 0)
+    {
+      info->correlated_depth--;
+    }
+
+  *continue_walk = PT_CONTINUE_WALK;
   return node;
 }
 
@@ -10519,13 +10551,16 @@ mq_adopt_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
  *	 was pushed into one of its references or if it can give a different result at each evaluation. A reference
  *	 joins the group if it comes after the representative and uses only columns of the representative, or if its
  *	 derived table differs from that of the representative in the SELECT list alone; the representative then
- *	 computes the columns of that reference too.
+ *	 computes the columns of that reference too. A reference in a correlated subquery does not join the group,
+ *	 since the workers of a parallel scan run such a subquery on a copy of the XASL in which the representative is
+ *	 not built.
  */
 static void
 mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
 {
   MQ_SHARED_VIEW_INFO info;
   bool grouped[MQ_SHARED_VIEW_MAX_SPECS], is_member[MQ_SHARED_VIEW_MAX_SPECS];
+  bool group_in_correlated[MQ_SHARED_VIEW_MAX_SPECS];
   PT_NODE *group[MQ_SHARED_VIEW_MAX_SPECS];
   PT_NODE *rep, *derived;
   int i, j, n, rep_idx, group_id = 0;
@@ -10537,7 +10572,9 @@ mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
     }
 
   info.n_specs = 0;
-  (void) parser_walk_tree (parser, statement, mq_collect_shared_derived_pre, &info, pt_continue_walk, NULL);
+  info.correlated_depth = 0;
+  (void) parser_walk_tree (parser, statement, mq_collect_shared_derived_pre, &info, mq_collect_shared_derived_post,
+			   &info);
 
   memset (grouped, 0, sizeof (grouped));
   for (i = 0; i < info.n_specs && group_id < PT_SHARED_VIEW_MAX_GROUPS; i++)
@@ -10554,6 +10591,7 @@ mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
 	  if (!grouped[j] && info.specs[j]->info.spec.vclass_origin == info.specs[i]->info.spec.vclass_origin)
 	    {
 	      grouped[j] = true;
+	      group_in_correlated[n] = info.in_correlated[j];
 	      group[n++] = info.specs[j];
 	      pushed = pushed || PT_IS_SPEC_FLAG_SET (info.specs[j], PT_SPEC_FLAG_PRED_PUSHED);
 	    }
@@ -10592,8 +10630,8 @@ mq_share_multi_ref_views (PARSER_CONTEXT * parser, PT_NODE * statement)
       for (j = rep_idx + 1; j < n; j++)
 	{
 	  derived = group[j]->info.spec.derived_table;
-	  is_member[j] = (PT_IS_SELECT (derived) && derived->info.query.correlation_level == 0
-			  && mq_is_adoptable_spec (group[j], rep)
+	  is_member[j] = (!group_in_correlated[j] && PT_IS_SELECT (derived)
+			  && derived->info.query.correlation_level == 0 && mq_is_adoptable_spec (group[j], rep)
 			  && (mq_has_view_columns (group[j], rep) || mq_add_view_columns (parser, group[j], rep)));
 	}
 
