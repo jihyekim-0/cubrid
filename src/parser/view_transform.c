@@ -10334,7 +10334,8 @@ mq_has_view_columns (PT_NODE * spec, PT_NODE * rep)
  *
  * Note: the columns are added only if the derived tables of spec and rep differ in their SELECT lists alone, so that
  *       they give the same rows and a column of spec can be computed from the tables of rep. A column with a
- *       subquery is not added. The columns are put after the named columns of rep, before its hidden columns.
+ *       subquery or one that can give a different result at each evaluation is not added. The columns are put after
+ *       the named columns of rep, before its hidden columns.
  */
 static bool
 mq_add_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
@@ -10344,6 +10345,7 @@ mq_add_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
   PT_NODE *attr, *col, *rep_attr, *new_attr, *new_col, *order;
   PT_NODE *attrs_head = NULL, *attrs_tail = NULL, *cols_head = NULL, *cols_tail = NULL;
   int n_rep_attrs, n_added = 0, pos;
+  bool found_unshareable = false;
 
   map.n_specs = 0;
   map.failed = false;
@@ -10396,6 +10398,13 @@ mq_add_view_columns (PARSER_CONTEXT * parser, PT_NODE * spec, PT_NODE * rep)
       attrs_tail = new_attr;
       cols_tail = new_col;
       n_added++;
+
+      /* the representative computes the column once, and each member must get a value of its own */
+      (void) parser_walk_tree (parser, new_col, mq_find_unshareable_expr, &found_unshareable, NULL, NULL);
+      if (found_unshareable)
+	{
+	  goto fail;
+	}
 
       (void) parser_walk_tree (parser, new_col, mq_map_column_names_pre, &map, NULL, NULL);
       if (map.failed)
